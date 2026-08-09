@@ -7,7 +7,7 @@ Android/JNI layer the Unity engine expects.
  
 ## Install & run
  
-You need files from your own copy of Fruit Ninja Classic+ (unzip the APK).
+You need files from your own copy of Fruit Ninja Classic+ 1.0.2 (unzip the APK).
  
 Put the `.nro` in `sdmc:/switch/fruitninja/` and place your game files next to it:
  
