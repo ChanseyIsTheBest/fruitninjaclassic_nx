@@ -168,16 +168,37 @@ static void *reg_local(void *ref) {
 static FakeString istr_pool[MAX_ISTR];
 static int istr_count = 0;
 
+/* Defined after the pools, which are declared below this point -- that file
+ * ordering is exactly why the old range test could only cover istr_pool. */
+static int ref_is_pooled(const void *r);
+
 static void free_ref(void *ref) {
   if (!ref)
     return;
-  if ((char *)ref >= (char *)istr_pool && (char *)ref < (char *)&istr_pool[MAX_ISTR])
-    return;  // interned string -- pooled, never freed
+  /* Round 155 (A5 in the shim-fixes note). Pooled references are SHARED: one
+   * object per class label, one string per contents, handed to every caller
+   * that asks. Freeing or tag-clearing one kills it for every other holder --
+   * from then on nx_tag_of() reports "not ours" for that label for the rest of
+   * the session, and every guard downstream silently takes its wrong branch.
+   *
+   * This test must come FIRST and cover EVERY pool. Previously only istr_pool
+   * was checked; iobj_pool, class_pool and id_pool survived only because their
+   * tags happen to fall through the switch below. That is luck, not design, and
+   * it stops being true the moment anything clears a tag before freeing --
+   * which is precisely what this round adds. */
+  if (ref_is_pooled(ref)) return;
   switch (nx_tag_of(ref)) {
-    case TAG_STRING: { FakeString *s = ref; free(s->utf); free(s); break; }
-    case TAG_PRIARR: { FakePriArray *a = ref; free(a->data); free(a); break; }
-    case TAG_OBJARR: { FakeObjArray *a = ref; free(a->items); free(a); break; }
-    case TAG_OBJECT: free(ref); break;
+    /* Clear the tag and the inner pointer BEFORE releasing anything (A4). It
+     * closes the window where the struct still reads a valid tag while its
+     * payload is already gone, and it makes a double delete harmless: the
+     * second call sees tag 0 and takes the default branch. */
+    case TAG_STRING: { FakeString *s = ref; char *u = s->utf;
+                       s->tag = 0; s->utf = NULL; free(u); free(s); break; }
+    case TAG_PRIARR: { FakePriArray *a = ref; void *d = a->data;
+                       a->tag = 0; a->data = NULL; a->len = 0; free(d); free(a); break; }
+    case TAG_OBJARR: { FakeObjArray *a = ref; void **it = a->items;
+                       a->tag = 0; a->items = NULL; a->len = 0; free(it); free(a); break; }
+    case TAG_OBJECT: *(volatile uint32_t *)ref = 0; free(ref); break;
     case BITMAP_TAG: text2bitmap_free((FakeBitmap *)ref); break;
     default: break; // TAG_ID / TAG_CLASS are pooled
   }
@@ -272,8 +293,15 @@ static void *make_pri_array_adopt(void *data, int len, int elem_size) {
 
 static const char *obj_str(void *jstr) {
   FakeString *s = jstr;
-  if (s && nx_tag_of(s) == TAG_STRING)
-    return s->utf;
+  if (s && nx_tag_of(s) == TAG_STRING) {
+    /* Round 156. utf CAN be NULL now: free_ref clears it before releasing the
+     * buffer (r155/A4), so a concurrent reader that already passed the tag
+     * check above can land in that window. Callers do strlen()/utf16_len()/
+     * utf[0] on this, so returning NULL is a crash where "" is a wrong answer.
+     * One load, then work off the copy. */
+    const char *u = *(const char * volatile const *)&s->utf;
+    return u ? u : "";
+  }
   return "";
 }
 
@@ -396,6 +424,7 @@ static void *get_classloader_obj(void) {
 
 #define MAX_IDS 512
 static FakeID id_pool[MAX_IDS];
+
 static int id_count = 0;
 
 /* ---- field writes (round 132) --------------------------------------------
@@ -661,6 +690,32 @@ typedef struct { uint32_t tag; uint32_t pad; long long ptr; } FakeProxy;
 static FakeProxy g_proxy_pool[MAX_PROXY_OBJ];
 static int g_proxy_pool_n = 0;
 static FakeProxy *g_last_proxy = 0;
+
+/* Every SHARED reference in this file -- five static pools and three calloc'd
+ * singletons. Defined here, below the last of them, so the list cannot be
+ * written before the things it has to cover exist; free_ref forward-declares it.
+ *
+ * The first version of this (round 155) listed only four pools and claimed to
+ * cover them all. It missed g_proxy_pool and the three singletons, which are
+ * shared exactly the same way. They stayed safe only because TAG_CLASS has no
+ * case in free_ref's switch and falls through `default:` -- the same luck this
+ * predicate exists to stop relying on. An audit caught it before it shipped.
+ *
+ * Adding a `case TAG_CLASS:` to that switch without adding the object here
+ * would kill a shared reference for every holder. If you add a pool or a
+ * singleton, add it here. */
+static int ref_is_pooled(const void *r) {
+  const char *p = (const char *)r;
+  if (!p) return 0;
+  if (r == (const void *)g_activity_obj ||
+      r == (const void *)g_asset_mgr    ||
+      r == (const void *)g_classloader) return 1;
+  return (p >= (const char *)istr_pool    && p < (const char *)&istr_pool[MAX_ISTR])    ||
+         (p >= (const char *)iobj_pool    && p < (const char *)&iobj_pool[MAX_IOBJ])    ||
+         (p >= (const char *)class_pool   && p < (const char *)&class_pool[MAX_CLASSES])||
+         (p >= (const char *)id_pool      && p < (const char *)&id_pool[MAX_IDS])       ||
+         (p >= (const char *)g_proxy_pool && p < (const char *)&g_proxy_pool[MAX_PROXY_OBJ]);
+}
 static void *proxy_make(long long ptr) {
   if (g_proxy_pool_n >= MAX_PROXY_OBJ) return jni_make_object("jniproxy");
   FakeProxy *p = &g_proxy_pool[g_proxy_pool_n++];
@@ -1383,7 +1438,7 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
    * Uri.encode(...); without real bytes the whole chain collapsed to "" and
    * every encoded-key pref collided. Route by the FakeString receiver. */
   if (recv && nx_tag_of(recv) == TAG_STRING && name_has(id->name, "getBytes")) {
-    const char *u = ((FakeString *)recv)->utf; int n = (int)strlen(u);
+    const char *u = safe_utf(recv); int n = (int)strlen(u);
     char *d = malloc(n > 0 ? n : 1); if (n) memcpy(d, u, n);
     return make_pri_array_adopt(d, n, 1);
   }
@@ -1460,9 +1515,10 @@ static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
   // on the receiver tag + method name, NOT id->cls. Returning 0 here (the old
   // act_int fall-through) undersizes the OBB-path sprintf buffer and overflows.
   if (recv && nx_tag_of(recv) == TAG_STRING) {
-    if (!strcmp(id->name, "length"))   return utf16_len(((FakeString *)recv)->utf);
+    /* safe_utf, not ->utf: the field can be NULL mid-free (see obj_str). */
+    if (!strcmp(id->name, "length"))   return utf16_len(safe_utf(recv));
     if (!strcmp(id->name, "hashCode")) return 0;
-    if (!strcmp(id->name, "isEmpty"))  return ((FakeString *)recv)->utf[0] == '\0';
+    if (!strcmp(id->name, "isEmpty"))  return safe_utf(recv)[0] == '\0';
     /* String.equals(Object) -- round 131. The ledger caught this falling to
      * act_int, i.e. we answered "not equal" for EVERY string comparison, and
      * marked it INSPECTED (Unity read the result back). Compare the UTF-8 the
@@ -1472,7 +1528,7 @@ static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
       const void *o = va_arg(va, void *);
       if (o == recv) return 1;
       if (!o || nx_tag_of(o) != TAG_STRING) return 0;
-      return !strcmp(((FakeString *)recv)->utf, ((FakeString *)o)->utf);
+      return !strcmp(safe_utf(recv), safe_utf((void *)o));
     }
   }
   /* Boxed PlayerPrefs value (Integer/Long/Boolean) from getAll(): unbox by the
@@ -1936,8 +1992,10 @@ static juint j_GetStringLength(void *env, void *jstr) {
 static juint j_GetArrayLength(void *env, void *arr) {
   (void)env;
   FakeObjArray *a = arr;
-  if (a && (nx_tag_of(a) == TAG_PRIARR || nx_tag_of(a) == TAG_OBJARR))
-    return a->len;
+  if (!a) return 0;
+  const uint32_t t = nx_tag_of(a);            /* one read, one possible warn */
+  if (t == TAG_PRIARR || t == TAG_OBJARR)
+    return *(int volatile const *)&a->len;
   return 0;
 }
 
@@ -1964,15 +2022,68 @@ void *jni_new_object_array(int len, void *fill) {
   return j_NewObjectArray(NULL, len, NULL, fill);
 }
 
+/* Empty array matching a method signature's return type, or NULL if the
+ * signature does not return an array. Round 158.
+ *
+ * act_object has had this rule since the r-old array work, but
+ * unity_dispatch_object answers first and its terminal hands back an OPAQUE
+ * OBJECT for anything unmatched -- so array-returning calls routed there never
+ * reached it. The r147 log shows InputDevice.getDeviceIds()[I taking that path
+ * twice per boot and landing in the r145 scratch buffer.
+ *
+ * Java semantics are the point: `null.length` throws, `new T[0].length` is 0,
+ * and every for-each over an empty array is skipped. An empty array is the
+ * correct way to say "none available"; an opaque object is silently mistaken
+ * for a real one, and GetArrayLength tag-checks it and answers 0 by accident
+ * rather than by design. */
+void *jni_new_empty_array(const char *sig) {
+  const char *r = sig ? strchr(sig, ')') : NULL;
+  if (!r || r[1] != '[') return NULL;
+  if (r[2] == 'L' || r[2] == '[') return jni_new_object_array(0, NULL);
+  int esz;
+  switch (r[2]) {
+    case 'J': case 'D': esz = 8; break;
+    case 'I': case 'F': esz = 4; break;
+    case 'S': case 'C': esz = 2; break;
+    default:            esz = 1; break;   /* Z, B */
+  }
+  return new_pri_array(0, esz);
+}
+
+/* Validate the value we are ABOUT to use, not the field it lives in (A2 in the
+ * shim-fixes note). The old form read a->items twice -- the compiler cannot
+ * cache it across the nx_tag_of() call -- so a concurrent free in that window
+ * could hand back a pointer that was never validated. Take exactly one load of
+ * each field and work off the local copies. */
+static void **objarr_items(const void *arr, int i) {
+  const FakeObjArray *a = arr;
+  if (!a || nx_tag_of(a) != TAG_OBJARR) return NULL;
+  void **it   = *(void ** volatile const *)&a->items;
+  const int n = *(int volatile const *)&a->len;
+  if (i < 0 || i >= n) return NULL;
+  /* 4, not 8 -- matches nx_tag_of's alignment contract (FakeID is 324 bytes,
+   * FakeClass 100, so pooled entries are only 4-aligned). 0xDE & 3 == 2, so
+   * this rejects a poisoned pointer without ever dereferencing it. */
+  if (!it || ((uintptr_t)it & 3u) || (uintptr_t)it < 0x1000u) return NULL;
+  return it;
+}
+
 static void *j_GetObjectArrayElement(void *env, void *arr, int i) {
   (void)env;
-  FakeObjArray *a = arr;
-  return (a && nx_tag_of(a) == TAG_OBJARR && i >= 0 && i < a->len) ? a->items[i] : NULL;
+  void **it = objarr_items(arr, i);
+  if (!it) return NULL;
+  void *v = it[i];
+  /* Do not hand poison back AS a jobject -- the caller will dereference it. */
+  if (v && (((uintptr_t)v & 3u) || (uintptr_t)v < 0x1000u)) return NULL;
+  return v;
 }
 static void j_SetObjectArrayElement(void *env, void *arr, int i, void *val) {
   (void)env;
-  FakeObjArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_OBJARR && i >= 0 && i < a->len) a->items[i] = val;
+  /* Same single-load rule as the getter, and it matters more here: this one
+   * WRITES through the pointer, so a stale items[] would corrupt whatever now
+   * owns that memory rather than just returning a bad value. */
+  void **it = objarr_items(arr, i);
+  if (it) it[i] = val;
 }
 
 /* Round 145. Never return NULL from here.
@@ -2002,7 +2113,15 @@ static uint8_t g_pri_scratch[8192];
 static void *j_GetPriArrayElements(void *env, void *arr, uint8_t *is_copy) {
   (void)env; if (is_copy) *is_copy = 0;
   FakePriArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_PRIARR) return a->data;
+  if (a && nx_tag_of(a) == TAG_PRIARR) {
+    /* Round 157. data CAN be NULL now: free_ref clears it before releasing the
+     * buffer (r155/A4), so a racing caller that already passed the tag check
+     * lands here with NULL. Returning it would reinstate the exact r145 crash --
+     * libunity's GetByteArrayElements caller does not null-check and copies 124
+     * bytes into whatever it gets. Fall through to the scratch buffer instead. */
+    void *d = *(void * volatile const *)&a->data;
+    if (d) return d;
+  }
   /* Shared and not thread-safe on purpose: this is a degradation path, and a
    * racing second caller getting the same zeroed bytes is still better than a
    * store to page 0. */
@@ -2022,14 +2141,20 @@ static void j_ReleasePriArrayElements(void *env, void *arr, void *elems, int mod
 static void j_GetPriArrayRegion(void *env, void *arr, int start, int len, void *buf) {
   (void)env;
   FakePriArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_PRIARR && start >= 0 && start + len <= a->len)
-    memcpy(buf, (char *)a->data + (size_t)start * a->elem_size, (size_t)len * a->elem_size);
+  if (!a || nx_tag_of(a) != TAG_PRIARR || !buf) return;
+  void *d = *(void * volatile const *)&a->data;      /* may be NULL: see above */
+  const int n = *(int volatile const *)&a->len;
+  if (!d || start < 0 || len < 0 || start + len > n) return;
+  memcpy(buf, (char *)d + (size_t)start * a->elem_size, (size_t)len * a->elem_size);
 }
 static void j_SetPriArrayRegion(void *env, void *arr, int start, int len, const void *buf) {
   (void)env;
   FakePriArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_PRIARR && start >= 0 && start + len <= a->len)
-    memcpy((char *)a->data + (size_t)start * a->elem_size, buf, (size_t)len * a->elem_size);
+  if (!a || nx_tag_of(a) != TAG_PRIARR || !buf) return;
+  void *d = *(void * volatile const *)&a->data;      /* may be NULL: see above */
+  const int n = *(int volatile const *)&a->len;
+  if (!d || start < 0 || len < 0 || start + len > n) return;
+  memcpy((char *)d + (size_t)start * a->elem_size, buf, (size_t)len * a->elem_size);
 }
 
 // --- fields -----------------------------------------------------------------
@@ -2494,13 +2619,20 @@ static void **env_table_ptr = env_table;
  * (otherwise static) FakeString / FakePriArray without duplicating the structs. */
 void *jni_bytearray_data(void *arr, int *len_out) {
   FakePriArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_PRIARR) { if (len_out) *len_out = a->len; return a->data; }
+  if (a && nx_tag_of(a) == TAG_PRIARR) {
+    void *d = *(void * volatile const *)&a->data;
+    /* Never hand back a non-zero length with a NULL pointer -- callers in
+     * unity_jni.c/unity_input.c loop to len_out. */
+    if (d) { if (len_out) *len_out = *(int volatile const *)&a->len; return d; }
+  }
   if (len_out) *len_out = 0;
   return NULL;
 }
 const char *jni_string_utf(void *jstr) {
   FakeString *s = jstr;
-  return (s && nx_tag_of(s) == TAG_STRING) ? s->utf : "";
+  if (!s || nx_tag_of(s) != TAG_STRING) return "";
+  const char *u = *(const char * volatile const *)&s->utf;   /* may be NULL: see obj_str */
+  return u ? u : "";
 }
 
 void *fake_env = &env_table_ptr;

@@ -294,6 +294,22 @@ static void nx_clock_tick(void *tm) {
           /* captured = threads whose SP+registers reached the mark. The four
            * miss counters must stay 0: any of them means a thread was scanned
            * from a stale range, which is the r119..r137 bug. */
+          { extern uint64_t nx_liveness_kept(void);
+            static uint64_t lk_last = 0;
+            const uint64_t lk = nx_liveness_kept();
+            /* Round 155. Non-zero means the liveness walk met an object whose
+             * HasParent test could not be evaluated and we KEPT it rather than
+             * dropping it. Before r155 each of these silently removed an object
+             * from UnloadUnusedAssets' live set, i.e. destroyed a live asset --
+             * the empty-screen softlock. A steady trickle here is expected and
+             * harmless; it is the count going up around a screen exit that
+             * explains a softlock. */
+            if (lk != lk_last) {
+              debugPrintf("[liveness] kept %llu object(s) with no typeHierarchy "
+                          "(+%llu since last)\n",
+                          (unsigned long long)lk, (unsigned long long)(lk - lk_last));
+              lk_last = lk;
+            } }
           { extern void nx_canary_stats(unsigned *, unsigned *, unsigned *);
             unsigned clive = 0, cev = 0, cslots = 0;
             nx_canary_stats(&clive, &cev, &cslots);
@@ -883,8 +899,11 @@ static int nx_addr_readable(uintptr_t a) {
  * preemptible, which is the case where GNU ld rejects R_AARCH64_ADR_PREL_PG_HI21
  * ("may be overridden"). Hidden makes it non-preemptible, so the pair is always
  * a valid link-time resolution. */
-__attribute__((visibility("hidden"))) uint64_t g_fn_liveness_body = 0;
+__attribute__((visibility("hidden"))) uint64_t g_fn_liveness_body  = 0;
+__attribute__((visibility("hidden"))) uint64_t g_fn_liveness_alive = 0;
+__attribute__((visibility("hidden"))) uint64_t g_fn_liveness_kept  = 0;
 extern void fn_liveness_guard(void);
+uint64_t nx_liveness_kept(void) { return g_fn_liveness_kept; }
 
 __asm__(
   ".text\n"
@@ -903,7 +922,7 @@ __asm__(
   "    ldr   x17, [x1, #8]\n"                    /* state->filter             */
   "    cbz   x17, .Lfnlg_orig\n"                 /* no filter: unchanged      */
   "    ldr   x16, [x16, #0xc8]\n"                /* klass->typeHierarchy      */
-  "    cbz   x16, .Lfnlg_zero\n"                 /* NEW: never set up -> false */
+  "    cbz   x16, .Lfnlg_alive\n"                /* cannot test -> keep it     */
   ".Lfnlg_orig:\n"
   "    stp   x30, x21, [sp, #-0x20]!\n"          /* the four clobbered        */
   "    stp   x20, x19, [sp, #0x10]\n"            /*  prologue instructions,   */
@@ -915,6 +934,33 @@ __asm__(
   ".Lfnlg_zero:\n"
   "    mov   w0, wzr\n"
   "    ret\n"
+  /* Round 155. typeHierarchy is NULL, so HasParent cannot be evaluated. The
+   * old guard returned 0 here, which skips +0x58 -- the list-add that reports
+   * the object as ALIVE. That is the wrong direction for THIS walk:
+   * LivenessState backs Resources.UnloadUnusedAssets, so an object missing
+   * from the list is treated as unreferenced and its asset is DESTROYED.
+   * Dropping a live UI atlas is how a screen comes back with nothing on it.
+   *
+   * Over-retention is always safe for a conservative walk; under-retention is
+   * not. So set up the frame exactly as the original prologue does and enter at
+   * +0x58, which adds and marks. w21 = 0 is honest: we reached here only on the
+   * has_references-clear path, and +0xac returns ubfx(w21,5,1) = 0. The
+   * epilogue there pops exactly what we push. */
+  ".Lfnlg_alive:\n"
+  "    adrp  x17, g_fn_liveness_kept\n"
+  "    add   x17, x17, :lo12:g_fn_liveness_kept\n"
+  "    ldr   x16, [x17]\n"
+  "    add   x16, x16, #1\n"
+  "    str   x16, [x17]\n"
+  "    stp   x30, x21, [sp, #-0x20]!\n"
+  "    stp   x20, x19, [sp, #0x10]\n"
+  "    mov   x19, x0\n"                          /* obj                        */
+  "    mov   x20, x1\n"                          /* state                      */
+  "    mov   w21, wzr\n"                         /* flags: no references       */
+  "    adrp  x16, g_fn_liveness_alive\n"
+  "    add   x16, x16, :lo12:g_fn_liveness_alive\n"
+  "    ldr   x16, [x16]\n"
+  "    br    x16\n"
   ".size fn_liveness_guard, .-fn_liveness_guard\n"
 );
 #endif
@@ -1662,7 +1708,8 @@ int main(int argc, char *argv[]) {
       } else {
         uint32_t thunk[4];
         const uint64_t dst = (uint64_t)(uintptr_t)&fn_liveness_guard;
-        g_fn_liveness_body = (uint64_t)(b + FN_IL2CPP_LIVENESS_BODY);
+        g_fn_liveness_body  = (uint64_t)(b + FN_IL2CPP_LIVENESS_BODY);
+        g_fn_liveness_alive = (uint64_t)(b + FN_IL2CPP_LIVENESS_ALIVE);
         thunk[0] = 0x58000051u;   /* ldr x17, #8  */
         thunk[1] = 0xd61f0220u;   /* br  x17      */
         memcpy(&thunk[2], &dst, sizeof dst);

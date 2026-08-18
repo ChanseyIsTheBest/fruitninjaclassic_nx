@@ -444,6 +444,16 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
   /* The r127 shape exactly: an opaque handle where a File or String belonged.
    * It never returns NULL, so nothing downstream can tell this apart from a
    * real object -- which is why it has to be in the ledger. */
+  /* Round 158: an opaque object is never a valid stand-in for a Java ARRAY.
+   * Covers getDeviceIds()[I, getObbDirs()[Ljava/io/File; and
+   * getDevices(I)[Landroid/media/AudioDeviceInfo; -- all three reached this
+   * terminal and were answered with a handle the game then passed to
+   * GetArrayElements. */
+  { void *empty = jni_new_empty_array(id->sig);
+    if (empty) {
+      jni_note_approx("EMPTY-ARRAY", cls, m, id->sig);
+      return empty;
+    } }
   jni_note_approx("OPAQUE-OBJ", cls, m, id->sig);
   return jni_make_object(cls); /* default: opaque handle, never NULL */
 }

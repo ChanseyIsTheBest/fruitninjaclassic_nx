@@ -193,6 +193,10 @@
 #define FN_HAVE_LIVENESS_GUARD   1
 #define FN_IL2CPP_LIVENESS_ADD   0x159dfb4u  /* add_process_object entry      */
 #define FN_IL2CPP_LIVENESS_BODY  0x159dfc4u  /* body, past the hooked 16 bytes */
+/* +0x58 = "report this object as ALIVE": ldr x0,[x20] (state->list) ; bl the
+ * list-add ; then orr #1 into obj->klass to mark it. Round 155 jumps here when
+ * the HasParent test cannot be performed -- see the veneer. */
+#define FN_IL2CPP_LIVENESS_ALIVE 0x159e00cu  /* add_process_object+0x58        */
 /* The four words the thunk overwrites, taken from the binary, not assumed:
  *   stp x30,x21,[sp,#-0x20]! / stp x20,x19,[sp,#0x10] / cbz x0,+0xa8 / ldr x8,[x0] */
 static const uint32_t FN_LIVENESS_PROLOGUE[4] = {

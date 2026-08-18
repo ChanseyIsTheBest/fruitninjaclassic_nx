@@ -36,6 +36,10 @@ void *jni_make_object(const char *label);
  * signature says it returns an array -- GetArrayLength() tag-checks, so an
  * opaque handle silently reports length 0. */
 void *jni_new_object_array(int len, void *fill);
+/* Empty array matching a signature's return type, or NULL if it returns no
+ * array. Use this before ANY opaque-object fallback: an opaque handle where a
+ * Java array belongs is silently read as length 0 by accident. */
+void *jni_new_empty_array(const char *sig);
 
 /* Print the JNI approximation ledger: every call answered by a catch-all, with
  * hit counts and whether Unity read the result back (ExceptionCheck). Safe to

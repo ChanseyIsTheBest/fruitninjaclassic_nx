@@ -121,7 +121,7 @@
 /* Bump when shipping. Printed at compile time (#pragma message in main.c)
  * and at boot, so a stale source tree is obvious from either the build
  * output or debug.log. */
-#define FN_SRC_REV   "r152"
+#define FN_SRC_REV   "r158"
 
 /* ---- Android package name -- VERIFY THIS AGAINST YOUR APK -----------------
  * Returned by our fake getPackageName(). Unity surfaces it as
